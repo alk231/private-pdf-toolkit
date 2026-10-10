@@ -1,0 +1,11 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+pikepdf==9.7.0
+reportlab==4.4.1
+img2pdf==0.6.1
+Pillow==11.2.1
+PyMuPDF==1.25.5
+ocrmypdf==16.10.4
+pytest==8.3.5
+httpx==0.28.1

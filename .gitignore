@@ -1,0 +1,15 @@
+.env
+**/.env
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/local.properties
+**/key.properties
+**/*.jks
+**/*.keystore
+**/GoogleService-Info.plist
+**/google-services.json
+__pycache__/
+.pytest_cache/
+.venv/

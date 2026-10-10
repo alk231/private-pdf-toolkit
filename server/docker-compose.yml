@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    expose: ["8000"]
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    mem_limit: 2g
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:
