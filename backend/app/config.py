@@ -24,6 +24,18 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+def _env_list(name: str) -> tuple[str, ...]:
+    """Comma-separated list; blanks and duplicates dropped, trailing slashes removed."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return ()
+    items: list[str] = []
+    for part in raw.split(","):
+        item = part.strip().rstrip("/")
+        if item and item not in items:
+            items.append(item)
+    return tuple(items)
+
 @dataclass(frozen=True)
 class Settings:
     # Where job files live (ephemeral). Only the "jobs" and "spool" subfolders are ever wiped.
@@ -49,6 +61,7 @@ class Settings:
     trust_proxy: bool = True  # read client IP from X-Forwarded-For (Render sits behind a proxy)
     enable_selftest_tools: bool = False  # test-only tools; keep off in production
     enable_docs: bool = False  # expose /docs and /openapi.json
+    cors_origins: tuple[str, ...] = ()  # allowed browser origins; empty = CORS disabled
 
     @property
     def max_file_bytes(self) -> int:
@@ -95,4 +108,5 @@ class Settings:
             trust_proxy=_env_bool("TRUST_PROXY", True),
             enable_selftest_tools=_env_bool("ENABLE_SELFTEST_TOOLS", False),
             enable_docs=_env_bool("ENABLE_DOCS", False),
+            cors_origins=_env_list("CORS_ORIGINS"),
         )

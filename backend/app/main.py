@@ -9,6 +9,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -22,13 +23,11 @@ from app.routes import router
 
 log = logging.getLogger("pdftoolkit")
 
-
 def _configure_logging() -> None:
     level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
     if not isinstance(level, int):
         level = logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
@@ -72,6 +71,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The last middleware added is the outermost one.
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes, limit_mb=settings.max_job_mb)
     app.add_middleware(SecurityHeadersMiddleware)
+    if settings.cors_origins:
+        # Outermost, so even 413 answers from the body limit carry the CORS headers.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_origins),
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["X-Device-Id", "Content-Type"],
+            expose_headers=["Content-Disposition", "X-Result-Meta"],
+            allow_credentials=False,
+            max_age=600,
+        )
 
     @app.exception_handler(AppError)
     async def handle_app_error(_request: Request, exc: AppError) -> JSONResponse:
@@ -99,6 +109,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(router)
     return app
-
 
 app = create_app()

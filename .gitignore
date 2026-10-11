@@ -15,3 +15,4 @@ venv/
 # Flutter (app/ is added in Stage 5)
 app/build/
 app/.dart_tool/
+scripts/smoke/.work/

@@ -1,0 +1,689 @@
+﻿### FILE: backend/app/main.py
+```
+"""FastAPI application factory. Run with: uvicorn app.main:app --host 0.0.0.0 --port $PORT"""
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app import __version__
+from app.config import Settings
+from app.errors import USER_MESSAGES, AppError
+from app.jobs import JobManager
+from app.middleware import BodyLimitMiddleware, SecurityHeadersMiddleware
+from app.ratelimit import RateLimiter
+from app.routes import router
+
+log = logging.getLogger("pdftoolkit")
+
+
+def _configure_logging() -> None:
+    level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    _configure_logging()
+
+    limiter_device = RateLimiter(settings.rate_limit_per_hour)
+    # Many phones share one carrier IP, so the per-IP allowance is 4x the per-device one.
+    limiter_ip = RateLimiter(settings.rate_limit_per_hour * 4)
+
+    def housekeeping() -> None:
+        limiter_device.prune()
+        limiter_ip.prune()
+
+    manager = JobManager(settings, housekeeping=housekeeping)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        previous_tmp = tempfile.tempdir
+        await manager.start()
+        tempfile.tempdir = str(manager.spool_dir)  # upload spool files live (and die) with the workspace
+        try:
+            yield
+        finally:
+            await manager.stop()
+            tempfile.tempdir = previous_tmp
+
+    app = FastAPI(
+        title="PDF Toolkit API",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url="/docs" if settings.enable_docs else None,
+        redoc_url=None,
+        openapi_url="/openapi.json" if settings.enable_docs else None,
+    )
+    app.state.settings = settings
+    app.state.manager = manager
+    app.state.limiter_device = limiter_device
+    app.state.limiter_dev = limiter_device  # name used by routes
+    app.state.limiter_ip = limiter_ip
+
+    # The last middleware added is the outermost one.
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes, limit_mb=settings.max_job_mb)
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    @app.exception_handler(AppError)
+    async def handle_app_error(_request: Request, exc: AppError) -> JSONResponse:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        return JSONResponse(exc.body(), status_code=exc.status, headers=headers)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        if exc.status_code == 404:
+            code, message = "not_found", "This address does not exist."
+        elif exc.status_code == 405:
+            code, message = "method_not_allowed", "This request method is not allowed."
+        else:
+            code, message = "invalid_request", USER_MESSAGES["invalid_request"]
+        return JSONResponse({"error": {"code": code, "message": message}}, status_code=exc.status_code)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(AppError(400, "invalid_request").body(), status_code=400)
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        log.error("unhandled %s on %s", type(exc).__name__, request.url.path)
+        return JSONResponse(AppError(500, "internal_error").body(), status_code=500)
+
+    app.include_router(router)
+    return app
+
+
+app = create_app()
+```
+
+### FILE: backend/app/config.py
+```
+"""Runtime configuration, read once from environment variables with safe defaults."""
+from __future__ import annotations
+
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+_MB = 1024 * 1024
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(value, minimum)
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+@dataclass(frozen=True)
+class Settings:
+    # Where job files live (ephemeral). Only the "jobs" and "spool" subfolders are ever wiped.
+    work_dir: Path = Path(tempfile.gettempdir()) / "pdf-toolkit"
+
+    # Limits requested in the project brief.
+    max_file_mb: int = 25
+    max_job_mb: int = 60
+    max_concurrent_jobs: int = 1
+    job_ttl_min: int = 45
+    job_timeout_sec: int = 120
+    rate_limit_per_hour: int = 30  # 0 disables rate limiting
+    ocr_max_pages: int = 30
+
+    # Extra safety knobs.
+    max_queue: int = 20  # jobs waiting in the queue
+    max_total_jobs: int = 40  # jobs alive at once (queued + running + finished-not-downloaded)
+    worker_memory_mb: int = 1024  # address-space limit per worker process (0 disables)
+    worker_max_output_mb: int = 300  # largest file a worker may write (0 disables)
+    fast_wait_sec: int = 20  # how long ?wait=true waits for a fast tool
+    min_free_disk_mb: int = 200  # refuse new jobs below this much free disk
+    janitor_interval_sec: int = 30
+    trust_proxy: bool = True  # read client IP from X-Forwarded-For (Render sits behind a proxy)
+    enable_selftest_tools: bool = False  # test-only tools; keep off in production
+    enable_docs: bool = False  # expose /docs and /openapi.json
+
+    @property
+    def max_file_bytes(self) -> int:
+        return self.max_file_mb * _MB
+
+    @property
+    def max_job_bytes(self) -> int:
+        return self.max_job_mb * _MB
+
+    @property
+    def max_body_bytes(self) -> int:
+        # Whole multipart body: files plus a little framing overhead.
+        return self.max_job_bytes + 2 * _MB
+
+    @property
+    def max_output_bytes(self) -> int:
+        return self.worker_max_output_mb * _MB
+
+    @property
+    def ttl_sec(self) -> int:
+        return self.job_ttl_min * 60
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        max_file = _env_int("MAX_FILE_MB", 25, 1)
+        max_job = max(_env_int("MAX_JOB_MB", 60, 1), max_file)
+        work_dir = os.environ.get("WORK_DIR") or str(Path(tempfile.gettempdir()) / "pdf-toolkit")
+        return cls(
+            work_dir=Path(work_dir),
+            max_file_mb=max_file,
+            max_job_mb=max_job,
+            max_concurrent_jobs=_env_int("MAX_CONCURRENT_JOBS", 1, 1),
+            job_ttl_min=_env_int("JOB_TTL_MIN", 45, 1),
+            job_timeout_sec=_env_int("JOB_TIMEOUT_SEC", 120, 1),
+            rate_limit_per_hour=_env_int("RATE_LIMIT_PER_HOUR", 30, 0),
+            ocr_max_pages=_env_int("OCR_MAX_PAGES", 30, 1),
+            max_queue=_env_int("MAX_QUEUE", 20, 1),
+            max_total_jobs=_env_int("MAX_TOTAL_JOBS", 40, 1),
+            worker_memory_mb=_env_int("WORKER_MEMORY_MB", 1024, 0),
+            worker_max_output_mb=_env_int("WORKER_MAX_OUTPUT_MB", 300, 0),
+            fast_wait_sec=_env_int("FAST_WAIT_SEC", 20, 0),
+            min_free_disk_mb=_env_int("MIN_FREE_DISK_MB", 200, 0),
+            janitor_interval_sec=_env_int("JANITOR_INTERVAL_SEC", 30, 1),
+            trust_proxy=_env_bool("TRUST_PROXY", True),
+            enable_selftest_tools=_env_bool("ENABLE_SELFTEST_TOOLS", False),
+            enable_docs=_env_bool("ENABLE_DOCS", False),
+        )
+```
+
+### FILE: backend/app/tools/catalog.py
+```
+"""Declarative list of tools. Light on purpose: the API process imports this, never the tool code."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str  # URL segment: POST /v1/tools/{name}
+    module: str  # module with run(ctx: ToolContext) -> ToolResult (imported only in the worker)
+    accepts: tuple[str, ...]  # allowed file kinds: "pdf", "image", ...
+    min_files: int = 1
+    max_files: int = 1
+    fast: bool = False  # may answer directly when called with ?wait=true
+    timeout_factor: float = 1.0  # multiplies JOB_TIMEOUT_SEC
+    memory_mb: int | None = None  # overrides WORKER_MEMORY_MB
+    internal: bool = False  # test-only tools, hidden unless ENABLE_SELFTEST_TOOLS=1
+
+_SELFTEST_MODULE = "app.tools.selftest"
+
+def _selftest(name: str, *, fast: bool = False) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        module=_SELFTEST_MODULE,
+        accepts=("pdf",),
+        min_files=1,
+        max_files=3,
+        fast=fast,
+        internal=True,
+    )
+
+def _page_tool(
+    name: str,
+    module: str,
+    *,
+    min_files: int = 1,
+    max_files: int = 1,
+    fast: bool = True,
+) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        module=f"app.tools.{module}",
+        accepts=("pdf",),
+        min_files=min_files,
+        max_files=max_files,
+        fast=fast,
+    )
+
+def _tool(
+    name: str,
+    module: str,
+    accepts: tuple[str, ...] = ("pdf",),
+    *,
+    min_files: int = 1,
+    max_files: int = 1,
+    fast: bool = False,
+    timeout_factor: float = 1.0,
+    memory_mb: int | None = None,
+) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        module=f"app.tools.{module}",
+        accepts=accepts,
+        min_files=min_files,
+        max_files=max_files,
+        fast=fast,
+        timeout_factor=timeout_factor,
+        memory_mb=memory_mb,
+    )
+
+_SELFTEST_TOOLS: tuple[ToolSpec, ...] = (
+    _selftest("selftest-copy", fast=True),
+    _selftest("selftest-multi"),
+    _selftest("selftest-fail"),
+    _selftest("selftest-sleep"),
+    _selftest("selftest-crash"),
+)
+
+# Stage 2: page tools.
+_PAGE_TOOLS: tuple[ToolSpec, ...] = (
+    _page_tool("merge", "merge", min_files=2, max_files=20),
+    _page_tool("split", "split", fast=False),
+    _page_tool("extract-pages", "extract_pages"),
+    _page_tool("remove-pages", "remove_pages"),
+    _page_tool("reorder", "reorder"),
+    _page_tool("rotate", "rotate"),
+    _page_tool("crop", "crop"),
+)
+
+# Stage 3: conversion, optimisation, security and editing tools.
+_STAGE3_TOOLS: tuple[ToolSpec, ...] = (
+    _tool("images-to-pdf", "images_to_pdf", ("image",), max_files=30, timeout_factor=1.5, memory_mb=1536),
+    _tool("pdf-to-images", "pdf_to_images", timeout_factor=2.0, memory_mb=1536),
+    _tool("compress", "compress", timeout_factor=2.0, memory_mb=1536),
+    _tool("protect", "protect", fast=True),
+    _tool("unlock", "unlock", fast=True),
+    _tool("page-numbers", "page_numbers", fast=True, memory_mb=1536),
+    _tool("watermark", "watermark", ("pdf", "image"), max_files=2, fast=True, memory_mb=1536),
+    _tool("metadata", "metadata"),
+)
+
+_ALL_TOOLS: tuple[ToolSpec, ...] = _SELFTEST_TOOLS + _PAGE_TOOLS + _STAGE3_TOOLS
+
+_BY_NAME: dict[str, ToolSpec] = {t.name: t for t in _ALL_TOOLS}
+
+def get_tool(name: str, *, include_internal: bool = False) -> ToolSpec | None:
+    spec = _BY_NAME.get(name)
+    if spec is None or (spec.internal and not include_internal):
+        return None
+    return spec
+
+def list_tools(*, include_internal: bool = False) -> list[ToolSpec]:
+    return [t for t in _ALL_TOOLS if include_internal or not t.internal]
+```
+
+### FILE: render.yaml
+```
+yamlservices:
+  - type: web
+    name: pdf-toolkit-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: MAX_FILE_MB
+        value: "25"
+      - key: MAX_JOB_MB
+        value: "60"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: JOB_TTL_MIN
+        value: "45"
+      - key: JOB_TIMEOUT_SEC
+        value: "120"
+      - key: RATE_LIMIT_PER_HOUR
+        value: "30"
+      - key: OCR_MAX_PAGES
+        value: "30"
+      - key: TRUST_PROXY
+        value: "true"
+```
+
+### FILE: docker-compose.yml
+```
+# LOCAL TESTING ONLY. Render uses render.yaml, not this file.
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      ENABLE_SELFTEST_TOOLS: "1"
+      ENABLE_DOCS: "1"
+      MAX_FILE_MB: "25"
+      MAX_JOB_MB: "60"
+      MAX_CONCURRENT_JOBS: "1"
+      JOB_TTL_MIN: "45"
+      JOB_TIMEOUT_SEC: "120"
+      RATE_LIMIT_PER_HOUR: "30"
+      OCR_MAX_PAGES: "30"
+    mem_limit: 512m
+    cpus: 1.0
+
+  # Runs the test suite in a throwaway container: docker compose --profile test run --rm tests
+  tests:
+    profiles: ["test"]
+    image: python:3.12-slim-bookworm
+    working_dir: /work
+    volumes:
+      - ./backend:/work
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    command: sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider"
+```
+
+### FILE: backend/pytest.ini
+```
+[pytest]
+testpaths = tests
+pythonpath = .
+filterwarnings =
+    ignore:Using .httpx. with .starlette.testclient. is deprecated
+```
+
+### FILE: backend/tests/test_images_pdf.py
+```
+from __future__ import annotations
+
+import io
+import zipfile
+
+import pymupdf
+import pytest
+
+from app.tools.images_to_pdf import layout
+from tests.helpers import make_pdf, post_tool
+from tests.image_fixtures import image_mode, image_size, make_image
+from tests.pdf_fixtures import failure_code, numbered_pdf, page_widths, result_pdf, run_tool
+
+
+def _flat(result):
+    page_w, page_h, (x0, y0, x1, y1) = result
+    return (page_w, page_h, x0, y0, x1, y1)
+
+
+def _zip_images(content: bytes) -> list[bytes]:
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        return [archive.read(name) for name in sorted(archive.namelist())]
+
+
+# ---------------------------------------------------------------- registry
+
+def test_stage3_tools_are_listed(client):
+    names = {tool["name"] for tool in client.get("/v1/tools").json()["tools"]}
+    assert {
+        "images-to-pdf",
+        "pdf-to-images",
+        "compress",
+        "protect",
+        "unlock",
+        "page-numbers",
+        "watermark",
+        "metadata",
+    } <= names
+
+
+# ---------------------------------------------------------------- layout maths
+
+def test_layout_fit_keeps_small_images_and_caps_large_ones():
+    assert _flat(layout(300, 200, "fit", "auto", 0)) == pytest.approx((300, 200, 0, 0, 300, 200))
+    page_w, page_h, _ = layout(2000, 1000, "fit", "auto", 0)
+    assert (page_w, page_h) == pytest.approx((842, 421))
+
+
+def test_layout_fixed_sizes_choose_orientation_and_centre_the_image():
+    assert _flat(layout(200, 100, "a4", "auto", 0)) == pytest.approx((842, 595, 0, 87, 842, 508))
+    page_w, page_h, _ = layout(100, 200, "a4", "auto", 0)
+    assert (page_w, page_h) == (595, 842)
+    page_w, page_h, _ = layout(100, 200, "letter", "landscape", 0)
+    assert (page_w, page_h) == (792, 612)
+
+
+def test_layout_margin_shrinks_the_image():
+    _, _, (x0, y0, x1, y1) = layout(100, 100, "a4", "portrait", 50)
+    assert x1 - x0 == pytest.approx(495)
+    assert y1 - y0 == pytest.approx(495)
+
+
+# ---------------------------------------------------------------- images-to-pdf
+
+def test_images_to_pdf_a4_with_auto_orientation(client):
+    files = [("a.png", make_image(300, 200)), ("b.jpg", make_image(200, 300, fmt="JPEG"))]
+    body, result = run_tool(client, "images-to-pdf", files)
+    assert body["status"] == "done", body
+    assert page_widths(result.content) == [842, 595]
+    assert body["meta"]["pages_out"] == 2
+
+
+def test_images_to_pdf_fit_matches_the_image(client):
+    data = result_pdf(client, "images-to-pdf", [("a.png", make_image(300, 200))], {"page_size": "fit"})
+    assert page_widths(data) == [300]
+
+
+def test_images_to_pdf_letter_forced_landscape(client):
+    data = result_pdf(
+        client,
+        "images-to-pdf",
+        [("a.png", make_image(100, 200))],
+        {"page_size": "letter", "orientation": "landscape"},
+    )
+    assert page_widths(data) == [792]
+
+
+def test_images_to_pdf_accepts_transparent_png_and_gif(client):
+    files = [
+        ("a.png", make_image(100, 100, (255, 0, 0, 128), mode="RGBA")),
+        ("b.gif", make_image(50, 40, (0, 128, 0), fmt="GIF")),
+    ]
+    data = result_pdf(client, "images-to-pdf", files)
+    assert len(page_widths(data)) == 2
+
+
+def test_images_to_pdf_embeds_one_image_per_page(client):
+    data = result_pdf(client, "images-to-pdf", [("a.png", make_image(300, 200))])
+    with pymupdf.open(stream=data, filetype="pdf") as doc:
+        assert [len(page.get_images()) for page in doc] == [1]
+
+
+def test_images_to_pdf_errors(client):
+    files = [("a.png", make_image(50, 50))]
+    assert failure_code(client, "images-to-pdf", files, {"page_size": "b5"}) == "invalid_options"
+    assert failure_code(client, "images-to-pdf", files, {"margin": 500}) == "invalid_options"
+    assert failure_code(client, "images-to-pdf", files, {"quality": "ultra"}) == "invalid_options"
+    broken = [("broken.png", b"\x89PNG\r\n\x1a\nthis is not really a png")]
+    assert failure_code(client, "images-to-pdf", broken) == "corrupted_file"
+
+
+def test_images_to_pdf_rejects_pdf_uploads(client):
+    response = post_tool(client, "images-to-pdf", files=[("a.pdf", make_pdf())])
+    assert response.status_code == 415
+
+
+# ---------------------------------------------------------------- pdf-to-images
+
+def test_pdf_to_images_returns_a_zip_of_jpgs(client):
+    body, result = run_tool(client, "pdf-to-images", [("d.pdf", numbered_pdf(3))], {"dpi": 72})
+    assert body["status"] == "done", body
+    assert body["result_name"] == "d_images.zip"
+    images = _zip_images(result.content)
+    assert [image_size(data)[0] for data in images] == [110, 120, 130]
+    assert all(data[:2] == b"\xff\xd8" for data in images)
+    assert body["meta"]["pages_out"] == 3
+
+
+def test_pdf_to_images_single_page_is_a_plain_image(client):
+    body, result = run_tool(client, "pdf-to-images", [("d.pdf", numbered_pdf(3))], {"pages": "2", "dpi": 72})
+    assert body["status"] == "done", body
+    assert result.content[:2] == b"\xff\xd8"
+    assert image_size(result.content) == (120, 200)
+
+
+def test_pdf_to_images_png_and_dpi(client):
+    data = result_pdf(
+        client, "pdf-to-images", [("d.pdf", numbered_pdf(1))], {"format": "png", "dpi": 144}
+    )
+    assert data[:4] == b"\x89PNG"
+    assert image_size(data) == (220, 400)
+
+
+def test_pdf_to_images_grayscale(client):
+    data = result_pdf(
+        client, "pdf-to-images", [("d.pdf", numbered_pdf(1))], {"grayscale": True, "dpi": 72}
+    )
+    assert image_mode(data) == "L"
+
+
+def test_pdf_to_images_password_flow(client):
+    files = [("d.pdf", numbered_pdf(2, password="secret"))]
+    assert failure_code(client, "pdf-to-images", files) == "password_required"
+    assert failure_code(client, "pdf-to-images", files, {"password": "nope"}) == "wrong_password"
+    data = result_pdf(client, "pdf-to-images", files, {"password": "secret", "pages": "1", "dpi": 72})
+    assert image_size(data) == (110, 200)
+
+
+def test_pdf_to_images_errors(client):
+    files = [("d.pdf", numbered_pdf(2))]
+    assert failure_code(client, "pdf-to-images", files, {"dpi": 50}) == "invalid_options"
+    assert failure_code(client, "pdf-to-images", files, {"format": "gif"}) == "invalid_options"
+    assert failure_code(client, "pdf-to-images", files, {"pages": "9"}) == "invalid_options"
+```
+
+### FILE: backend/app/tools/images_to_pdf.py
+```
+"""Turn images (JPG, PNG, WebP, GIF, BMP, TIFF) into one PDF: one image per page, in upload order.
+
+Images are shrunk to a sensible size and stored as JPEG to keep the PDF small. Transparent areas become white.
+Animated GIFs and multi-page TIFFs use their first frame.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pymupdf
+from PIL import Image, ImageOps
+
+from app.tools.base import OutputFile, ToolContext, ToolError, ToolResult
+from app.tools.pdfutil import PDF_MIME, make_meta
+
+Image.MAX_IMAGE_PIXELS = 40_000_000  # warns above this, refuses above twice this
+
+PAGE_SIZES = {"a4": (595.0, 842.0), "letter": (612.0, 792.0)}  # portrait, points
+QUALITY = {"high": (3508, 90), "medium": (2480, 80), "low": (1654, 65)}  # (longest side px, JPEG quality)
+FIT_LONG_SIDE = 842.0
+MIN_PAGE = 36.0
+MAX_PAGE = 14000.0
+
+
+def layout(
+    width_px: int,
+    height_px: int,
+    size: str,
+    orientation: str,
+    margin: float,
+) -> tuple[float, float, tuple[float, float, float, float]]:
+    """Return (page_width, page_height, (x0, y0, x1, y1) of the image) in points."""
+    if size == "fit":
+        scale = min(1.0, FIT_LONG_SIDE / max(width_px, height_px))
+        draw_w, draw_h = width_px * scale, height_px * scale
+        page_w = min(max(draw_w + 2 * margin, MIN_PAGE), MAX_PAGE)
+        page_h = min(max(draw_h + 2 * margin, MIN_PAGE), MAX_PAGE)
+    else:
+        base_w, base_h = PAGE_SIZES[size]
+        if orientation == "auto":
+            landscape = width_px > height_px
+        else:
+            landscape = orientation == "landscape"
+        page_w, page_h = (base_h, base_w) if landscape else (base_w, base_h)
+        avail_w = max(page_w - 2 * margin, 1.0)
+        avail_h = max(page_h - 2 * margin, 1.0)
+        scale = min(avail_w / width_px, avail_h / height_px)
+        draw_w, draw_h = width_px * scale, height_px * scale
+    x0 = (page_w - draw_w) / 2
+    y0 = (page_h - draw_h) / 2
+    return page_w, page_h, (x0, y0, x0 + draw_w, y0 + draw_h)
+
+
+def _flatten(image: Image.Image) -> Image.Image:
+    mode = image.mode
+    if mode in ("RGB", "L"):
+        return image
+    if mode in ("RGBA", "LA", "PA") or (mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    if mode == "1":
+        return image.convert("L")
+    if mode in ("I", "I;16", "I;16L", "I;16B", "F"):
+        return image.convert("I").point(lambda value: value * (1 / 256)).convert("L")
+    return image.convert("RGB")
+
+
+def _prepare(src: Path, dest: Path, max_side: int, quality: int) -> tuple[int, int]:
+    """Decode, shrink, fix orientation, flatten and save as JPEG. Returns the pixel size."""
+    with Image.open(src) as opened:
+        opened.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)  # JPEGs are decoded at reduced size
+        try:
+            upright = ImageOps.exif_transpose(opened)
+        except Exception:
+            upright = opened
+        flat = _flatten(upright)
+        flat.save(dest, "JPEG", quality=quality, optimize=True)
+        return flat.size
+
+
+def run(ctx: ToolContext) -> ToolResult:
+    size = ctx.opt_str("page_size", "a4", allowed=("fit", "a4", "letter"))
+    orientation = ctx.opt_str("orientation", "auto", allowed=("auto", "portrait", "landscape"))
+    margin = ctx.opt_int("margin", 0 if size == "fit" else 24, minimum=0, maximum=144)
+    quality_name = ctx.opt_str("quality", "medium", allowed=tuple(QUALITY))
+    max_side, jpeg_quality = QUALITY[quality_name]
+
+    count = len(ctx.inputs)
+    dest = ctx.out_path("images.pdf")
+    doc = pymupdf.open()
+    try:
+        for number, item in enumerate(ctx.inputs, start=1):
+            prepared = ctx.tmp_dir / f"img_{number}.jpg"
+            try:
+                width_px, height_px = _prepare(item.path, prepared, max_side, jpeg_quality)
+            except ToolError:
+                raise
+            except Exception as exc:
+                if type(exc).__name__ in ("DecompressionBombError", "MemoryError"):
+                    raise
+                raise ToolError("corrupted_file", f"Image {number} could not be read.") from exc
+
+            page_w, page_h, box = layout(width_px, height_px, size, orientation, float(margin))
+            page = doc.new_page(width=page_w, height=page_h)
+            page.insert_image(pymupdf.Rect(*box), filename=str(prepared), keep_proportion=False)
+            ctx.progress(5 + 80 * number // count)
+        ctx.progress(90)
+        doc.save(str(dest), garbage=3, deflate=True)
+    finally:
+        doc.close()
+
+    name = f"{ctx.inputs[0].stem[:80]}.pdf" if count == 1 else "images.pdf"
+    return ToolResult(
+        outputs=[OutputFile(dest, name, PDF_MIME)],
+        meta=make_meta(ctx, [dest], count, count),
+    )
+```
+
