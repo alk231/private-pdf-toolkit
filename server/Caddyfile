@@ -1,9 +1,0 @@
-{$DOMAIN} {
-    request_body {
-        max_size 160MB
-    }
-    reverse_proxy api:8000
-    log {
-        output discard
-    }
-}

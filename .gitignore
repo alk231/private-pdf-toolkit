@@ -1,15 +1,17 @@
-.env
-**/.env
-**/.dart_tool/
-**/build/
-**/.flutter-plugins
-**/.flutter-plugins-dependencies
-**/local.properties
-**/key.properties
-**/*.jks
-**/*.keystore
-**/GoogleService-Info.plist
-**/google-services.json
+# Python
 __pycache__/
-.pytest_cache/
+*.pyc
 .venv/
+venv/
+.pytest_cache/
+
+# Secrets / local config
+.env
+
+# Editors / OS
+.idea/
+.DS_Store
+
+# Flutter (app/ is added in Stage 5)
+app/build/
+app/.dart_tool/

@@ -1,0 +1,27 @@
+yamlservices:
+  - type: web
+    name: pdf-toolkit-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: MAX_FILE_MB
+        value: "25"
+      - key: MAX_JOB_MB
+        value: "60"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: JOB_TTL_MIN
+        value: "45"
+      - key: JOB_TIMEOUT_SEC
+        value: "120"
+      - key: RATE_LIMIT_PER_HOUR
+        value: "30"
+      - key: OCR_MAX_PAGES
+        value: "30"
+      - key: TRUST_PROXY
+        value: "true"
